@@ -1,0 +1,188 @@
+# SQLite Storage Plan for Multi-User OLX Bot
+
+## Summary
+Переводим хранение данных (пользователи, allowlist, запросы, обработанные объявления и результаты парсинга) в SQLite. Excel остаётся как сейчас (пер‑пользовательские файлы), но источником истины станет база. При старте бот проверяет наличие таблиц и создает их.
+
+## Decisions Locked In
+- Одна общая БД: `data/olx.db`
+- Excel сохраняем (пер‑пользовательские файлы, как сейчас)
+- Миграция только JSON: allowlist, queries, seen_ids → SQLite. Excel не импортируем.
+
+---
+
+## DB Schema (Tables)
+
+### 1) `schema_migrations`
+```
+id INTEGER PRIMARY KEY
+version INTEGER NOT NULL
+applied_at TEXT NOT NULL
+```
+
+### 2) `users`
+```
+user_id INTEGER PRIMARY KEY
+chat_id INTEGER
+is_admin INTEGER NOT NULL DEFAULT 0
+is_allowed INTEGER NOT NULL DEFAULT 0
+created_at TEXT NOT NULL
+updated_at TEXT NOT NULL
+```
+
+### 3) `queries`
+```
+id INTEGER PRIMARY KEY AUTOINCREMENT
+user_id INTEGER NOT NULL
+query TEXT NOT NULL
+price_from INTEGER
+price_to INTEGER
+city TEXT
+created_at TEXT NOT NULL
+last_run TEXT
+active INTEGER NOT NULL DEFAULT 1
+
+UNIQUE(user_id, query, price_from, price_to, city)
+FOREIGN KEY(user_id) REFERENCES users(user_id)
+```
+
+### 4) `listings`
+```
+id INTEGER PRIMARY KEY AUTOINCREMENT
+user_id INTEGER NOT NULL
+query_id INTEGER
+listing_id TEXT NOT NULL
+url TEXT NOT NULL
+title TEXT
+price INTEGER
+currency TEXT
+location TEXT
+posted_at TEXT
+scraped_at TEXT NOT NULL
+image_url TEXT
+description TEXT
+seller_rating REAL
+seller_reviews INTEGER
+seller_score REAL
+sheet_name TEXT
+
+UNIQUE(user_id, listing_id)
+FOREIGN KEY(user_id) REFERENCES users(user_id)
+FOREIGN KEY(query_id) REFERENCES queries(id)
+```
+
+### 5) `seen_listings`
+```
+id INTEGER PRIMARY KEY AUTOINCREMENT
+user_id INTEGER NOT NULL
+listing_id TEXT NOT NULL
+url TEXT
+first_seen_at TEXT NOT NULL
+
+UNIQUE(user_id, listing_id)
+FOREIGN KEY(user_id) REFERENCES users(user_id)
+```
+
+---
+
+## Environment Changes
+Добавить в `.env.example`:
+```
+DB_PATH=data/olx.db
+```
+
+---
+
+## App Logic Changes (High-Level)
+
+### 1) DB Access Layer
+- Создать `db.py`:
+  - `get_conn()`
+  - `init_db()` → create tables if not exist + schema_migrations check
+  - CRUD helpers for users/allowlist/queries/seen/listings
+
+### 2) Startup Initialization
+- `init_db()` вызывается при старте бота.
+- Автомиграция JSON → DB:
+  - `allowed_users.json` → `users` (is_allowed=1)
+  - `data/users/<id>/queries.json` → `queries`
+  - `data/users/<id>/seen_ids.json` → `seen_listings`
+- Migration run only if DB is empty (e.g. no users).
+
+### 3) Allowlist + Admin
+- `users` table источник истины.
+- `/allow` / `/deny` обновляют `users.is_allowed`.
+- `ADMIN_CHAT_IDS` синхронизируется с `users.is_admin=1` при старте.
+
+### 4) Queries
+- Добавление/удаление запросов → `queries` table.
+- `/list` читает из `queries`.
+
+### 5) Scrape Flow
+- Для каждого user_id:
+  - Получаем активные queries
+  - Проверяем cooldown через `queries.last_run`
+  - После скрейпа записываем в:
+    - `listings`
+    - `seen_listings`
+  - `queries.last_run` обновляется
+- Excel сохраняется как сейчас (из текущего списка новых объявлений).
+
+### 6) Daily Reports
+- Отправка отчёта идёт по каждому user_id
+- Excel остается per-user (как сейчас)
+
+---
+
+## Test & Validation
+
+1) **DB Init**
+   - Запуск без DB → создаются таблицы, версия 1 в `schema_migrations`.
+
+2) **Migration**
+   - Если есть JSON allowlist и queries → они попадают в БД.
+   - Повторный запуск не дублирует (idempotent).
+
+3) **Allowlist**
+   - `/allow` добавляет пользователя → `users.is_allowed=1`
+   - `/deny` снимает доступ → `users.is_allowed=0`
+
+4) **Queries**
+   - `/list` показывает только DB queries.
+   - `/remove` удаляет/деактивирует query.
+
+5) **Scrape**
+   - Новые объявления → `listings` + `seen_listings`.
+   - Дубликаты не пишутся (unique constraint).
+
+---
+
+## Step-by-Step Implementation
+
+1) **Branch & Packages**
+   - Создать ветку `sqlite_storage`
+   - Добавить зависимость: `sqlite3` встроена в Python (доп. пакеты не нужны)
+   - Добавить `DB_PATH` в `.env.example`
+
+2) **DB Layer**
+   - Реализовать `db.py` с `init_db`, CRUD.
+
+3) **Refactor Storage**
+   - Заменить `storage.py` операции чтения/записи JSON на DB access.
+
+4) **Bot Changes**
+   - Все handlers (queries/allowlist/run/report) работают через DB.
+   - Cooldown опирается на `queries.last_run`.
+
+5) **Migration**
+   - Run-once миграция JSON → DB при старте.
+
+6) **Testing**
+   - Запустить `python -m py_compile`
+   - Смоделировать /allow, /run, /report в тестовом чате.
+
+---
+
+## Assumptions
+- В БД один общий файл `data/olx.db`.
+- Excel остаётся per-user и используется для отчётов.
+- Только JSON миграция; существующие Excel не импортируются.

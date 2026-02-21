@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 
 def ensure_dir(path: Path) -> None:
@@ -34,3 +34,15 @@ def load_seen_ids(path: Path) -> Dict[str, str]:
 
 def save_seen_ids(path: Path, seen: Dict[str, str]) -> None:
     save_json(path, seen)
+
+
+def load_allowed_users(path: Path) -> Set[int]:
+    raw = load_json(path, default=[])
+    try:
+        return {int(x) for x in raw}
+    except Exception:
+        return set()
+
+
+def save_allowed_users(path: Path, users: Set[int]) -> None:
+    save_json(path, sorted(users))
