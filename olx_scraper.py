@@ -87,6 +87,7 @@ class Listing:
     seller_rating: Optional[float] = None
     seller_reviews: Optional[int] = None
     seller_score: Optional[float] = None
+    matched_tags: Optional[str] = None
 
 
 def _parse_date(text: str, now: datetime) -> Optional[datetime]:

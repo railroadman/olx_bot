@@ -54,6 +54,8 @@ HELP_TEXT = (
     "Название, от 1000 до 50000, Город\n"
     "или без города:\n"
     "Название, от 1000 до 50000\n\n"
+    "Новый формат:\n"
+    "search: Название price: 1000,4000 city: Одесса tags: слово1, слово2\n\n"
     "Команды:\n"
     "/help — список команд\n"
     "/list — список запросов\n"
@@ -107,7 +109,11 @@ def _is_admin(user_id: int) -> bool:
 
 def _allowed_users() -> Set[int]:
     ensure_dir(DATA_DIR)
-    return load_allowed_users(ALLOWED_USERS_FILE)
+    users = load_allowed_users(ALLOWED_USERS_FILE)
+    if ADMIN_CHAT_IDS:
+        users |= ADMIN_CHAT_IDS
+        save_allowed_users(ALLOWED_USERS_FILE, users)
+    return users
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -116,10 +122,71 @@ def _is_allowed(user_id: int) -> bool:
     return user_id in _allowed_users()
 
 
+def _parse_query_new_format(text: str) -> Optional[Dict]:
+    raw = text.strip()
+    if not raw:
+        return None
+    pattern = re.compile(r"(?i)\\b(search|price|цена|city|город|tags|теги)\\s*:\\s*")
+    matches = list(pattern.finditer(raw))
+    if not matches:
+        return None
+
+    chunks = []
+    for i, m in enumerate(matches):
+        key = m.group(1).lower()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(raw)
+        value = raw[start:end].strip()
+        chunks.append((key, value))
+
+    data: Dict[str, Optional[str]] = {"search": None, "price": None, "city": None, "tags": None}
+    for key, value in chunks:
+        if key in ("search",):
+            data["search"] = value
+        elif key in ("price", "цена"):
+            data["price"] = value
+        elif key in ("city", "город"):
+            data["city"] = value
+        elif key in ("tags", "теги"):
+            data["tags"] = value
+
+    if not data["search"]:
+        return None
+
+    price_from = None
+    price_to = None
+    if data["price"]:
+        nums = re.findall(r"\\d+", data["price"])
+        if len(nums) >= 1:
+            price_from = int(nums[0])
+        if len(nums) >= 2:
+            price_to = int(nums[1])
+
+    tags_list = None
+    if data["tags"]:
+        tags_list = [t.strip() for t in data["tags"].split(",") if t.strip()]
+        if not tags_list:
+            tags_list = None
+
+    return {
+        "query": data["search"],
+        "price_from": price_from,
+        "price_to": price_to,
+        "city": data["city"],
+        "tags": tags_list,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def _parse_query(text: str) -> Optional[Dict]:
     raw = text.strip()
     if not raw:
         return None
+
+    if re.search(r"(?i)\\b(search|price|цена|city|город|tags|теги)\\s*:", raw):
+        parsed = _parse_query_new_format(raw)
+        if parsed:
+            return parsed
 
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     if not parts:
@@ -147,6 +214,7 @@ def _parse_query(text: str) -> Optional[Dict]:
         "price_from": price_from,
         "price_to": price_to,
         "city": city,
+        "tags": None,
         "created_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -156,6 +224,84 @@ def _translate_ru_uk(text: str) -> Optional[str]:
         return GoogleTranslator(source="auto", target="uk").translate(text)
     except Exception:
         return None
+
+
+def _is_cyrillic(text: str) -> bool:
+    return any("а" <= ch <= "я" or "А" <= ch <= "Я" or ch in "іІїЇєЄґҐ" for ch in text)
+
+
+def _word_pattern(base: str) -> str:
+    base = base.strip()
+    if not base:
+        return ""
+    if len(base) <= 3:
+        core = re.escape(base)
+    else:
+        core = re.escape(base[:4])
+    return r"\b" + core + r"\w*"
+
+
+def _parse_numeric_tag(tag: str) -> Optional[Dict[str, Optional[int]]]:
+    if "=" not in tag:
+        return None
+    name, value = tag.split("=", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name or not value:
+        return None
+    nums = [int(x) for x in re.findall(r"\d+", value)]
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return {"name": name, "min": nums[0], "max": None}
+    return {"name": name, "min": nums[0], "max": nums[1]}
+
+
+def _match_numeric_tag(tag_info: Dict[str, Optional[int]], description: str) -> bool:
+    name = tag_info["name"] or ""
+    if not name:
+        return False
+    word_pat = _word_pattern(name)
+    if not word_pat:
+        return False
+    pattern = word_pat + r"(?:\W+\w+){0,5}?\W*([0-9]+)"
+    for m in re.finditer(pattern, description, flags=re.IGNORECASE):
+        try:
+            val = int(m.group(1))
+        except Exception:
+            continue
+        min_v = tag_info["min"]
+        max_v = tag_info["max"]
+        if min_v is not None and max_v is not None:
+            if min_v <= val <= max_v:
+                return True
+        elif min_v is not None:
+            if val >= min_v:
+                return True
+    return False
+
+
+def _match_tags(tags: Optional[List[str]], description: Optional[str]) -> Optional[str]:
+    if not tags or not description:
+        return None
+    found: List[str] = []
+    for tag in tags:
+        t = tag.strip()
+        if not t:
+            continue
+        numeric = _parse_numeric_tag(t)
+        if numeric:
+            if _match_numeric_tag(numeric, description):
+                found.append(tag)
+            continue
+        pattern = _word_pattern(t)
+        if not pattern:
+            continue
+        if re.search(pattern, description, flags=re.IGNORECASE):
+            found.append(tag)
+    if not found:
+        return None
+    return ", ".join(found)
 
 
 def _append_to_excel(user_id: int, listings: List[Listing]) -> int:
@@ -185,6 +331,7 @@ def _append_to_excel(user_id: int, listings: List[Listing]) -> int:
                 "seller_rating": l.seller_rating,
                 "seller_reviews": l.seller_reviews,
                 "seller_score": l.seller_score,
+                "matched_tags": l.matched_tags,
             }
         )
 
@@ -278,6 +425,7 @@ def _load_recent_from_excel(excel_path: Path, hours: int = 24) -> List[Listing]:
                 seller_rating=row.get("seller_rating", None),
                 seller_reviews=row.get("seller_reviews", None),
                 seller_score=row.get("seller_score", None),
+                matched_tags=row.get("matched_tags", None),
                 sheet_name=row.get("__sheet", None),
             )
         )
@@ -461,6 +609,7 @@ async def _run_scrape_for_user(user_id: int, app: Application, force: bool = Fal
                 continue
             seen[l.listing_id] = l.url
             l.sheet_name = sheet_name
+            l.matched_tags = _match_tags(q.get("tags"), l.description)
             new_listings.append(l)
 
     added = _append_to_excel(user_id, new_listings)
@@ -549,7 +698,10 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if q.get("price_from") is not None and q.get("price_to") is not None:
             price = f", от {q['price_from']} до {q['price_to']}"
         extra = f" (uk: {q['query_uk']})" if q.get("query_uk") else ""
-        lines.append(f"{i}. {q['query']}{price}{city}{extra}")
+        tags = ""
+        if q.get("tags"):
+            tags = f" tags: {', '.join(q['tags'])}"
+        lines.append(f"{i}. {q['query']}{price}{city}{extra}{tags}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -748,6 +900,7 @@ def main() -> None:
     app.add_handler(CommandHandler("run", cmd_run))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("allow", cmd_allow))
     app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("users", cmd_users))
